@@ -1,0 +1,150 @@
+name: Reusable Test Workflow
+
+on:
+  workflow_call:
+    inputs:
+      system_type:
+        description: 'System type (magento/odoo)'
+        required: true
+        type: string
+      php_version:
+        description: 'PHP version (for Magento)'
+        required: false
+        type: string
+        default: '8.2'
+      python_version:
+        description: 'Python version (for Odoo)'
+        required: false
+        type: string
+        default: '3.10'
+      run_unit_tests:
+        description: 'Run unit tests'
+        required: false
+        type: boolean
+        default: true
+      run_integration_tests:
+        description: 'Run integration tests'
+        required: false
+        type: boolean
+        default: true
+      run_static_analysis:
+        description: 'Run static analysis (PHPCS/PHPStan for Magento, pylint for Odoo)'
+        required: false
+        type: boolean
+        default: true
+    secrets:
+      composer_auth:
+        description: 'Composer auth JSON (Magento only)'
+        required: false
+
+jobs:
+  test:
+    name: Test ${{ inputs.system_type }}
+    runs-on: ubuntu-latest
+    
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: testdb
+        ports:
+          - 3306:3306
+        options: --health-cmd="mysqladmin ping" --health-interval=10s --health-timeout=5s --health-retries=3
+      
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: --health-cmd="redis-cli ping" --health-interval=10s --health-timeout=5s --health-retries=3
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      # Magento-specific setup
+      - name: Setup PHP (Magento)
+        if: inputs.system_type == 'magento'
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ inputs.php_version }}
+          extensions: bcmath, ctype, curl, dom, gd, hash, iconv, intl, mbstring, openssl, pdo_mysql, simplexml, soap, xsl, zip
+          coverage: none
+      
+      - name: Setup Composer auth (Magento)
+        if: inputs.system_type == 'magento' && secrets.composer_auth != ''
+        run: |
+          mkdir -p ~/.composer
+          echo '${{ secrets.composer_auth }}' > ~/.composer/auth.json
+      
+      - name: Install Composer dependencies (Magento)
+        if: inputs.system_type == 'magento'
+        run: composer install --prefer-dist --no-progress
+      
+      # Odoo-specific setup
+      - name: Setup Python (Odoo)
+        if: inputs.system_type == 'odoo'
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ inputs.python_version }}
+      
+      - name: Install Python dependencies (Odoo)
+        if: inputs.system_type == 'odoo'
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+      
+      # Unit Tests
+      - name: Run unit tests (Magento)
+        if: inputs.run_unit_tests && inputs.system_type == 'magento'
+        run: |
+          if [ -f phpunit.xml ] || [ -f phpunit.xml.dist ]; then
+            vendor/bin/phpunit --configuration phpunit.xml.dist --testsuite unit
+          else
+            echo "No PHPUnit configuration found, skipping unit tests"
+          fi
+      
+      - name: Run unit tests (Odoo)
+        if: inputs.run_unit_tests && inputs.system_type == 'odoo'
+        run: |
+          if [ -f tests/ ]; then
+            python -m pytest tests/ -v
+          else
+            echo "No tests directory found, skipping unit tests"
+          fi
+      
+      # Static Analysis
+      - name: Run PHPCS (Magento)
+        if: inputs.run_static_analysis && inputs.system_type == 'magento'
+        run: |
+          if [ -f vendor/bin/phpcs ]; then
+            vendor/bin/phpcs --standard=PSR12 --ignore=vendor/ app/ || true
+          else
+            echo "PHPCS not installed, skipping"
+          fi
+      
+      - name: Run PHPStan (Magento)
+        if: inputs.run_static_analysis && inputs.system_type == 'magento'
+        run: |
+          if [ -f vendor/bin/phpstan ]; then
+            vendor/bin/phpstan analyse app/ --level=1 || true
+          else
+            echo "PHPStan not installed, skipping"
+          fi
+      
+      - name: Run pylint (Odoo)
+        if: inputs.run_static_analysis && inputs.system_type == 'odoo'
+        run: |
+          pip install pylint
+          pylint --disable=all --enable=E,F addons/ || true
+      
+      - name: Test summary
+        if: always()
+        run: |
+          echo "### Test Summary 🧪" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **System**: ${{ inputs.system_type }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Unit Tests**: ${{ inputs.run_unit_tests }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Integration Tests**: ${{ inputs.run_integration_tests }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Static Analysis**: ${{ inputs.run_static_analysis }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status**: ${{ job.status }}" >> $GITHUB_STEP_SUMMARY

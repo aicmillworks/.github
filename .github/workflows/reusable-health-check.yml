@@ -1,0 +1,123 @@
+name: Reusable Health Check Workflow
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: 'Environment to check (staging/production)'
+        required: true
+        type: string
+      url:
+        description: 'URL to check'
+        required: true
+        type: string
+      expected_status:
+        description: 'Expected HTTP status code'
+        required: false
+        type: number
+        default: 200
+      timeout_seconds:
+        description: 'Timeout in seconds'
+        required: false
+        type: number
+        default: 10
+      max_attempts:
+        description: 'Maximum number of attempts'
+        required: false
+        type: number
+        default: 3
+      notify_on_failure:
+        description: 'Send notification on failure'
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  health-check:
+    name: Health Check - ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Check URL health
+        id: health-check
+        run: |
+          echo "🏥 Checking health of ${{ inputs.url }}"
+          
+          ATTEMPT=1
+          SUCCESS=false
+          
+          while [ $ATTEMPT -le ${{ inputs.max_attempts }} ]; do
+            echo "Attempt $ATTEMPT of ${{ inputs.max_attempts }}..."
+            
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time ${{ inputs.timeout_seconds }} ${{ inputs.url }} || echo "000")
+            
+            echo "Received HTTP $HTTP_CODE"
+            
+            if [ $HTTP_CODE -eq ${{ inputs.expected_status }} ]; then
+              echo "✅ Health check passed!"
+              SUCCESS=true
+              break
+            fi
+            
+            ATTEMPT=$((ATTEMPT + 1))
+            
+            if [ $ATTEMPT -le ${{ inputs.max_attempts }} ]; then
+              echo "Waiting 15 seconds before retry..."
+              sleep 15
+            fi
+          done
+          
+          if [ "$SUCCESS" = false ]; then
+            echo "❌ Health check failed after ${{ inputs.max_attempts }} attempts"
+            echo "health_status=failed" >> $GITHUB_OUTPUT
+            exit 1
+          else
+            echo "health_status=passed" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Check response time
+        run: |
+          echo "⏱️ Measuring response time..."
+          
+          RESPONSE_TIME=$(curl -o /dev/null -s -w '%{time_total}' ${{ inputs.url }})
+          echo "Response time: ${RESPONSE_TIME}s"
+          
+          # Alert if response time > 5 seconds
+          if (( $(echo "$RESPONSE_TIME > 5" | bc -l) )); then
+            echo "⚠️ Warning: Response time is high (${RESPONSE_TIME}s)"
+          fi
+          
+          echo "response_time=${RESPONSE_TIME}" >> $GITHUB_ENV
+      
+      - name: SSL certificate check
+        run: |
+          echo "🔒 Checking SSL certificate..."
+          
+          DOMAIN=$(echo ${{ inputs.url }} | sed -e 's|^[^/]*//||' -e 's|/.*$||')
+          
+          if echo ${{ inputs.url }} | grep -q "https://"; then
+            EXPIRY=$(echo | openssl s_client -servername $DOMAIN -connect $DOMAIN:443 2>/dev/null | openssl x509 -noout -enddate | cut -d= -f2)
+            EXPIRY_EPOCH=$(date -d "$EXPIRY" +%s)
+            CURRENT_EPOCH=$(date +%s)
+            DAYS_LEFT=$(( ($EXPIRY_EPOCH - $CURRENT_EPOCH) / 86400 ))
+            
+            echo "SSL certificate expires in $DAYS_LEFT days"
+            
+            if [ $DAYS_LEFT -lt 30 ]; then
+              echo "⚠️ Warning: SSL certificate expires in less than 30 days!"
+            fi
+          else
+            echo "Skipping SSL check for non-HTTPS URL"
+          fi
+      
+      - name: Health check summary
+        if: always()
+        run: |
+          echo "### Health Check Report 🏥" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Environment**: ${{ inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **URL**: ${{ inputs.url }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Expected Status**: ${{ inputs.expected_status }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status**: ${{ steps.health-check.outputs.health_status }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Response Time**: ${response_time}s" >> $GITHUB_STEP_SUMMARY
+          echo "- **Timestamp**: $(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY

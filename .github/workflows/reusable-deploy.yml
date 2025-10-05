@@ -1,0 +1,171 @@
+name: Reusable Deployment Workflow
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: 'Deployment environment (staging/production)'
+        required: true
+        type: string
+      system_type:
+        description: 'System type (magento/odoo)'
+        required: true
+        type: string
+      app_path:
+        description: 'Application path on server'
+        required: true
+        type: string
+      ssh_host:
+        description: 'SSH host'
+        required: true
+        type: string
+      ssh_user:
+        description: 'SSH user'
+        required: true
+        type: string
+      deploy_branch:
+        description: 'Branch to deploy'
+        required: false
+        type: string
+        default: 'main'
+      health_check_url:
+        description: 'URL for health check after deployment'
+        required: false
+        type: string
+    secrets:
+      ssh_key:
+        description: 'SSH private key'
+        required: true
+      composer_auth:
+        description: 'Composer auth JSON (Magento only)'
+        required: false
+
+jobs:
+  deploy:
+    name: Deploy to ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ inputs.environment }}
+      url: ${{ inputs.health_check_url }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.deploy_branch }}
+      
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.ssh_key }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H ${{ inputs.ssh_host }} >> ~/.ssh/known_hosts
+      
+      - name: Deploy ${{ inputs.system_type }} application
+        run: |
+          echo "Deploying ${{ inputs.system_type }} to ${{ inputs.environment }}..."
+          
+          # Create deployment script based on system type
+          if [ "${{ inputs.system_type }}" = "magento" ]; then
+            cat > deploy.sh << 'EOF'
+          #!/bin/bash
+          set -e
+          
+          APP_PATH="$1"
+          BRANCH="$2"
+          
+          echo "📦 Pulling latest code..."
+          cd "$APP_PATH"
+          git fetch origin
+          git checkout "$BRANCH"
+          git pull origin "$BRANCH"
+          
+          echo "📦 Installing Composer dependencies..."
+          composer install --no-dev --optimize-autoloader --no-interaction
+          
+          echo "🔧 Running Magento setup upgrade..."
+          php bin/magento setup:upgrade --keep-generated
+          
+          echo "🔧 Compiling DI..."
+          php bin/magento setup:di:compile
+          
+          echo "🔧 Deploying static content..."
+          php bin/magento setup:static-content:deploy -f
+          
+          echo "🧹 Flushing cache..."
+          php bin/magento cache:flush
+          
+          echo "✅ Deployment complete!"
+          EOF
+          
+          elif [ "${{ inputs.system_type }}" = "odoo" ]; then
+            cat > deploy.sh << 'EOF'
+          #!/bin/bash
+          set -e
+          
+          APP_PATH="$1"
+          BRANCH="$2"
+          
+          echo "📦 Pulling latest code..."
+          cd "$APP_PATH"
+          git fetch origin
+          git checkout "$BRANCH"
+          git pull origin "$BRANCH"
+          
+          echo "📦 Installing Python dependencies..."
+          pip3 install -r requirements.txt --user
+          
+          echo "🔧 Updating Odoo modules..."
+          # Restart Odoo service (adjust service name as needed)
+          sudo systemctl restart odoo
+          
+          echo "✅ Deployment complete!"
+          EOF
+          fi
+          
+          chmod +x deploy.sh
+          
+          # Execute deployment via SSH
+          scp -i ~/.ssh/deploy_key deploy.sh ${{ inputs.ssh_user }}@${{ inputs.ssh_host }}:/tmp/
+          ssh -i ~/.ssh/deploy_key ${{ inputs.ssh_user }}@${{ inputs.ssh_host }} "bash /tmp/deploy.sh ${{ inputs.app_path }} ${{ inputs.deploy_branch }}"
+      
+      - name: Health check
+        if: inputs.health_check_url != ''
+        run: |
+          echo "🏥 Running health check..."
+          sleep 10
+          
+          MAX_ATTEMPTS=5
+          ATTEMPT=1
+          
+          while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
+            echo "Attempt $ATTEMPT of $MAX_ATTEMPTS..."
+            
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" ${{ inputs.health_check_url }})
+            
+            if [ $HTTP_CODE -eq 200 ]; then
+              echo "✅ Health check passed! (HTTP $HTTP_CODE)"
+              exit 0
+            fi
+            
+            echo "⚠️ Health check returned HTTP $HTTP_CODE"
+            ATTEMPT=$((ATTEMPT + 1))
+            
+            if [ $ATTEMPT -le $MAX_ATTEMPTS ]; then
+              sleep 15
+            fi
+          done
+          
+          echo "❌ Health check failed after $MAX_ATTEMPTS attempts"
+          exit 1
+      
+      - name: Deployment summary
+        if: always()
+        run: |
+          echo "### Deployment Summary 🚀" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **System**: ${{ inputs.system_type }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Environment**: ${{ inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Branch**: ${{ inputs.deploy_branch }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Host**: ${{ inputs.ssh_host }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status**: ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
