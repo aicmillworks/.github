@@ -126,8 +126,8 @@ jobs:
           chmod +x deploy.sh
           
           # Execute deployment via SSH
-          scp -i ~/.ssh/deploy_key deploy.sh ${{ inputs.ssh_user }}@${{ inputs.ssh_host }}:/tmp/
-          ssh -i ~/.ssh/deploy_key ${{ inputs.ssh_user }}@${{ inputs.ssh_host }} "bash /tmp/deploy.sh ${{ inputs.app_path }} ${{ inputs.deploy_branch }}"
+          scp -o IdentitiesOnly=yes -i ~/.ssh/deploy_key deploy.sh ${{ inputs.ssh_user }}@${{ inputs.ssh_host }}:/tmp/
+          ssh -o IdentitiesOnly=yes -i ~/.ssh/deploy_key ${{ inputs.ssh_user }}@${{ inputs.ssh_host }} "bash /tmp/deploy.sh ${{ inputs.app_path }} ${{ inputs.deploy_branch }}"
       
       - name: Health check
         if: inputs.health_check_url != ''
