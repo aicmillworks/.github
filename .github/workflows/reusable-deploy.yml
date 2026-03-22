@@ -81,7 +81,7 @@ jobs:
           git pull origin "$BRANCH"
           
           echo "📦 Installing Composer dependencies..."
-          composer install --no-dev --optimize-autoloader --no-interaction
+          composer install --no-dev --no-interaction
           
           echo "🧹 Clearing generated code..."
           rm -rf generated/code/* generated/metadata/*
@@ -91,6 +91,9 @@ jobs:
           
           echo "🔧 Compiling DI..."
           php bin/magento setup:di:compile
+          
+          echo "📦 Optimizing autoloader (after compile)..."
+          composer dump-autoload --optimize --no-dev
           
           echo "🔧 Deploying static content..."
           php bin/magento setup:static-content:deploy -f
@@ -136,7 +139,7 @@ jobs:
         if: inputs.health_check_url != ''
         run: |
           echo "🏥 Running health check..."
-          sleep 10
+          sleep 30
           
           MAX_ATTEMPTS=5
           ATTEMPT=1
@@ -144,7 +147,7 @@ jobs:
           while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
             echo "Attempt $ATTEMPT of $MAX_ATTEMPTS..."
             
-            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" ${{ inputs.health_check_url }})
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 ${{ inputs.health_check_url }})
             
             if [ $HTTP_CODE -eq 200 ]; then
               echo "✅ Health check passed! (HTTP $HTTP_CODE)"
