@@ -83,8 +83,11 @@ jobs:
           echo "📦 Installing Composer dependencies..."
           composer install --no-dev --optimize-autoloader --no-interaction
           
+          echo "🧹 Clearing generated code..."
+          rm -rf generated/code/* generated/metadata/*
+          
           echo "🔧 Running Magento setup upgrade..."
-          php bin/magento setup:upgrade --keep-generated
+          php bin/magento setup:upgrade
           
           echo "🔧 Compiling DI..."
           php bin/magento setup:di:compile
