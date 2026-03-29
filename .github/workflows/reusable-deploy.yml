@@ -69,19 +69,56 @@ jobs:
           if [ "${{ inputs.system_type }}" = "magento" ]; then
             cat > deploy.sh << 'EOF'
           #!/bin/bash
-          set -e
+          set -eo pipefail
           
           APP_PATH="$1"
           BRANCH="$2"
+          BACKUP_DIR="/tmp/magento_deploy_backup_$$"
+          
+          cd "$APP_PATH"
+          
+          # Cleanup function — runs on any failure
+          cleanup_on_failure() {
+            local exit_code=$?
+            echo ""
+            echo "❌ Deployment failed at line $BASH_LINENO (exit code: $exit_code)"
+            echo "🔄 Rolling back..."
+          
+            # Restore deployed_version.txt if backup exists
+            if [ -f "$BACKUP_DIR/deployed_version.txt" ]; then
+              echo "  Restoring deployed_version.txt..."
+              cp "$BACKUP_DIR/deployed_version.txt" pub/static/deployed_version.txt
+            fi
+          
+            # Flush cache so restored static version is recognized
+            php bin/magento cache:flush 2>/dev/null || true
+          
+            # Disable maintenance mode so site is accessible
+            php bin/magento maintenance:disable 2>/dev/null || true
+          
+            # Clean up backup dir
+            rm -rf "$BACKUP_DIR"
+          
+            echo "🔄 Rollback complete. Site is serving with previous static content."
+            exit $exit_code
+          }
+          
+          trap cleanup_on_failure ERR
+          
+          # Create backup directory
+          mkdir -p "$BACKUP_DIR"
           
           echo "📦 Pulling latest code..."
-          cd "$APP_PATH"
+          git stash --quiet 2>/dev/null || true
           git fetch origin
           git checkout "$BRANCH"
           git pull origin "$BRANCH"
           
           echo "📦 Installing Composer dependencies..."
           composer install --no-dev --no-interaction
+          
+          echo "🔒 Enabling maintenance mode..."
+          php bin/magento maintenance:enable
           
           echo "🧹 Clearing generated code..."
           rm -rf generated/code/* generated/metadata/*
@@ -95,11 +132,31 @@ jobs:
           echo "📦 Optimizing autoloader (after compile)..."
           composer dump-autoload --optimize --no-dev
           
+          # Back up deployed_version.txt before static deploy destroys it
+          if [ -f pub/static/deployed_version.txt ]; then
+            echo "💾 Backing up deployed_version.txt..."
+            cp pub/static/deployed_version.txt "$BACKUP_DIR/deployed_version.txt"
+          fi
+          
           echo "🔧 Deploying static content..."
           php bin/magento setup:static-content:deploy -f
           
+          # Verify deployed_version.txt was recreated
+          if [ ! -f pub/static/deployed_version.txt ]; then
+            echo "⚠️ deployed_version.txt missing after static deploy — restoring backup"
+            if [ -f "$BACKUP_DIR/deployed_version.txt" ]; then
+              cp "$BACKUP_DIR/deployed_version.txt" pub/static/deployed_version.txt
+            fi
+          fi
+          
           echo "🧹 Flushing cache..."
           php bin/magento cache:flush
+          
+          echo "🔓 Disabling maintenance mode..."
+          php bin/magento maintenance:disable
+          
+          # Clean up backup
+          rm -rf "$BACKUP_DIR"
           
           echo "✅ Deployment complete!"
           EOF
@@ -139,7 +196,7 @@ jobs:
         if: inputs.health_check_url != ''
         run: |
           echo "🏥 Running health check..."
-          sleep 30
+          sleep 10
           
           MAX_ATTEMPTS=5
           ATTEMPT=1
@@ -147,14 +204,19 @@ jobs:
           while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
             echo "Attempt $ATTEMPT of $MAX_ATTEMPTS..."
             
-            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 ${{ inputs.health_check_url }})
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 60 ${{ inputs.health_check_url }})
             
             if [ $HTTP_CODE -eq 200 ]; then
               echo "✅ Health check passed! (HTTP $HTTP_CODE)"
               exit 0
             fi
             
-            echo "⚠️ Health check returned HTTP $HTTP_CODE"
+            if [ $HTTP_CODE -eq 503 ]; then
+              echo "⚠️ Site in maintenance mode (HTTP 503) — deploy may have failed"
+            else
+              echo "⚠️ Health check returned HTTP $HTTP_CODE"
+            fi
+            
             ATTEMPT=$((ATTEMPT + 1))
             
             if [ $ATTEMPT -le $MAX_ATTEMPTS ]; then
