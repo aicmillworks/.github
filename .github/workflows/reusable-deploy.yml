@@ -84,31 +84,46 @@ jobs:
             echo "❌ Deployment failed at line $BASH_LINENO (exit code: $exit_code)"
             echo "🔄 Rolling back..."
           
-            # Restore deployed_version.txt if backup exists
-            if [ -f "$BACKUP_DIR/deployed_version.txt" ]; then
-              echo "  Restoring deployed_version.txt..."
-              cp "$BACKUP_DIR/deployed_version.txt" pub/static/deployed_version.txt
+            # Regenerate static if the version file is missing — more robust than only
+            # restoring the version string, since setup:upgrade/di:compile may have wiped
+            # the actual pub/static version dirs; fall back to the early backup. (MAG2-416)
+            if [ ! -f pub/static/deployed_version.txt ]; then
+              php bin/magento setup:static-content:deploy -f en_US 2>/dev/null || true
+              if [ ! -f pub/static/deployed_version.txt ] && [ -f "$BACKUP_DIR/deployed_version.txt" ]; then
+                cp "$BACKUP_DIR/deployed_version.txt" pub/static/deployed_version.txt
+              fi
             fi
-          
+
             # Flush cache so restored static version is recognized
             php bin/magento cache:flush 2>/dev/null || true
-          
-            # Disable maintenance mode so site is accessible
-            php bin/magento maintenance:disable 2>/dev/null || true
-          
+
+            # Only re-open the site if static is actually present; otherwise LEAVE maintenance
+            # ON (friendly 503) for manual recovery rather than exposing a raw 500. (MAG2-416)
+            if [ -f pub/static/deployed_version.txt ]; then
+              php bin/magento maintenance:disable 2>/dev/null || true
+              echo "🔄 Rollback complete. Site serving with restored static content."
+            else
+              echo "⚠️ deployed_version.txt still missing — LEAVING MAINTENANCE MODE ON; run: php bin/magento setup:static-content:deploy -f en_US"
+            fi
+
             # Clean up backup dir
             rm -rf "$BACKUP_DIR"
-          
-            echo "🔄 Rollback complete. Site is serving with previous static content."
             exit $exit_code
           }
           
           trap cleanup_on_failure ERR
           
-          # Create backup directory
+          # Create backup directory + back up deployed_version.txt EARLY, before anything
+          # (setup:upgrade / di:compile / static-content) can wipe pub/static. (MAG2-416)
           mkdir -p "$BACKUP_DIR"
-          
+          if [ -f pub/static/deployed_version.txt ]; then
+            cp pub/static/deployed_version.txt "$BACKUP_DIR/deployed_version.txt"
+          fi
+
           echo "📦 Pulling latest code..."
+          # NOTE: git stash is never popped — it silently stashes the server's uncommitted env
+          # files (app/etc/config.php, hyva-themes.json) each deploy. Out of scope for the
+          # outage fix; tracked as MAG2-416 "Deferred".
           git stash --quiet 2>/dev/null || true
           git fetch origin
           git checkout "$BRANCH"
@@ -120,42 +135,55 @@ jobs:
           echo "🔒 Enabling maintenance mode..."
           php bin/magento maintenance:enable
           
-          echo "🧹 Clearing generated code..."
-          rm -rf generated/code/* generated/metadata/*
-          
+          # Atomic generated/ swap (NOT rm -rf): a single rename can't be raced by on-demand
+          # class generation from queue consumers / cron. Core MAG2-416 fix — the old
+          # "rm -rf generated/code/*" raced with live consumers ("Directory not empty"),
+          # failing mid-deploy after pub/static was already wiped -> 500. Per runbook §4,
+          # atomic mv is safe even with consumers running, so no consumer-stop (avoids the
+          # pkill self-kill trap + cross-user permission no-ops).
+          echo "🧹 Swapping generated/ atomically + clearing preprocessed templates..."
+          mv generated "generated.old.$(date +%s)" 2>/dev/null || true
+          mkdir -p generated/code generated/metadata
+          rm -rf var/view_preprocessed/* 2>/dev/null || true
+
+          echo "📦 Composer autoload (pre-compile, non-optimized)..."
+          composer dump-autoload --no-dev
+
           echo "🔧 Running Magento setup upgrade..."
           php bin/magento setup:upgrade
-          
+
           echo "🔧 Compiling DI..."
           php bin/magento setup:di:compile
-          
-          echo "📦 Optimizing autoloader (after compile)..."
+
+          echo "📦 Composer autoload (optimized, after compile)..."
           composer dump-autoload --optimize --no-dev
           
-          # Back up deployed_version.txt before static deploy destroys it
-          if [ -f pub/static/deployed_version.txt ]; then
-            echo "💾 Backing up deployed_version.txt..."
-            cp pub/static/deployed_version.txt "$BACKUP_DIR/deployed_version.txt"
-          fi
-          
           echo "🔧 Deploying static content..."
-          php bin/magento setup:static-content:deploy -f
-          
-          # Verify deployed_version.txt was recreated
-          if [ ! -f pub/static/deployed_version.txt ]; then
-            echo "⚠️ deployed_version.txt missing after static deploy — restoring backup"
-            if [ -f "$BACKUP_DIR/deployed_version.txt" ]; then
-              cp "$BACKUP_DIR/deployed_version.txt" pub/static/deployed_version.txt
-            fi
+          php bin/magento setup:static-content:deploy -f en_US
+
+          # Belt-and-suspenders: restore the early backup if static deploy produced no version file
+          if [ ! -f pub/static/deployed_version.txt ] && [ -f "$BACKUP_DIR/deployed_version.txt" ]; then
+            cp "$BACKUP_DIR/deployed_version.txt" pub/static/deployed_version.txt
           fi
-          
+
+          # Hard gate: never disable maintenance on a site with no static version. A missing
+          # file here trips the ERR trap (regenerate + keep maintenance ON) instead of a 500.
+          if [ ! -f pub/static/deployed_version.txt ]; then
+            echo "FATAL: deployed_version.txt missing after static deploy — aborting into rollback"
+            false
+          fi
+
           echo "🧹 Flushing cache..."
           php bin/magento cache:flush
-          
+
+          echo "🔁 Reindexing catalogsearch_fulltext..."
+          php bin/magento indexer:reindex catalogsearch_fulltext || true
+
           echo "🔓 Disabling maintenance mode..."
           php bin/magento maintenance:disable
-          
-          # Clean up backup
+
+          # Prune old generated backups (keep most recent 1) + clean up version backup
+          ls -dt generated.old.* 2>/dev/null | tail -n +2 | xargs -r rm -rf 2>/dev/null || true
           rm -rf "$BACKUP_DIR"
           
           echo "✅ Deployment complete!"
