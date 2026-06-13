@@ -73,8 +73,11 @@ jobs:
           
           APP_PATH="$1"
           BRANCH="$2"
+          HEALTH_URL="$3"
           BACKUP_DIR="/tmp/magento_deploy_backup_$$"
-          
+          ENV_TOKEN="$(basename "$APP_PATH")"
+          HEALTH_HOST="${HEALTH_URL#*://}"; HEALTH_HOST="${HEALTH_HOST%%/*}"
+
           cd "$APP_PATH"
           
           # Cleanup function — runs on any failure
@@ -106,6 +109,9 @@ jobs:
               echo "⚠️ deployed_version.txt still missing — LEAVING MAINTENANCE MODE ON; run: php bin/magento setup:static-content:deploy -f en_US"
             fi
 
+            # MAG2-426: restore this env's crontab (re-enable cron:run) before cleanup
+            [ -s "$BACKUP_DIR/crontab.bak" ] && crontab "$BACKUP_DIR/crontab.bak" 2>/dev/null || true
+
             # Clean up backup dir
             rm -rf "$BACKUP_DIR"
             exit $exit_code
@@ -135,12 +141,28 @@ jobs:
           echo "🔒 Enabling maintenance mode..."
           php bin/magento maintenance:enable
           
-          # Atomic generated/ swap (NOT rm -rf): a single rename can't be raced by on-demand
-          # class generation from queue consumers / cron. Core MAG2-416 fix — the old
-          # "rm -rf generated/code/*" raced with live consumers ("Directory not empty"),
-          # failing mid-deploy after pub/static was already wiped -> 500. Per runbook §4,
-          # atomic mv is safe even with consumers running, so no consumer-stop (avoids the
-          # pkill self-kill trap + cross-user permission no-ops).
+          # MAG2-426: stop background writers BEFORE clearing/compiling. cron:run +
+          # cron_consumers_runner repopulate generated/code during di:compile's internal
+          # regenerate → "rmdir … Directory not empty" + a failed/partial compile (confirmed
+          # on prod run 27469722563). The atomic mv below protects only the INITIAL clear;
+          # di:compile's own clear still races live writers, so the MAG2-416 "atomic mv is
+          # enough, no consumer-stop" assumption was wrong. Per runbook §4 + CLAUDE.md
+          # DI-graph prerequisites, stop them. The crontab is SHARED across staging+prod and
+          # its only cron:run targets prod — disable ONLY this env's lines (match $ENV_TOKEN),
+          # never the other env's; on staging this matches nothing (no staging cron) = no-op.
+          echo "🛑 Stopping background writers for $ENV_TOKEN (MAG2-426)..."
+          crontab -l > "$BACKUP_DIR/crontab.bak" 2>/dev/null || true
+          if [ -s "$BACKUP_DIR/crontab.bak" ]; then
+            crontab -l 2>/dev/null | sed "\|$ENV_TOKEN.*cron:run|s|^|# MAG2-426-DEPLOY-DISABLED |" | crontab - 2>/dev/null || true
+          fi
+          # Kill this env's in-flight cron:run + queue consumers. Separate commands; this
+          # script's argv (bash /tmp/deploy.sh <app_path> ...) contains $ENV_TOKEN but NOT
+          # "cron:run"/"queue:consumers:start", so no pkill self-kill. Best-effort.
+          pkill -f "$ENV_TOKEN.*cron:run" 2>/dev/null || true
+          pkill -f "$ENV_TOKEN.*queue:consumers:start" 2>/dev/null || true
+          sleep 3   # let any in-flight on-demand class generation settle
+
+          # Atomic generated/ swap (NOT rm -rf): the rename itself can't be raced. (MAG2-416)
           echo "🧹 Swapping generated/ atomically + clearing preprocessed templates..."
           mv generated "generated.old.$(date +%s)" 2>/dev/null || true
           mkdir -p generated/code generated/metadata
@@ -182,10 +204,32 @@ jobs:
           echo "🔓 Disabling maintenance mode..."
           php bin/magento maintenance:disable
 
+          # MAG2-426: restore this env's crontab (re-enable cron:run); consumers restart on
+          # the next cron tick.
+          [ -s "$BACKUP_DIR/crontab.bak" ] && crontab "$BACKUP_DIR/crontab.bak" 2>/dev/null || true
+
+          # MAG2-426: real post-deploy health check — server-side against the origin
+          # (https://10.64.162.42/ with the env Host header) so it BYPASSES the Cloudflare WAF
+          # that 403s the GitHub-runner curl. A non-200 here fails the deploy (→ ERR trap), so
+          # a red run now means a genuinely unhealthy deploy, not the routine WAF 403.
+          if [ -n "$HEALTH_HOST" ]; then
+            echo "🏥 Health check (origin 10.64.162.42, Host: $HEALTH_HOST)..."
+            HC_OK=0
+            for attempt in 1 2 3 4 5; do
+              HC=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 30 -H "Host: $HEALTH_HOST" https://10.64.162.42/ 2>/dev/null || echo 000)
+              if [ "$HC" = "200" ]; then echo "✅ Health check passed (HTTP 200)"; HC_OK=1; break; fi
+              echo "⚠️ attempt $attempt: HTTP $HC"; sleep 10
+            done
+            if [ "$HC_OK" != "1" ]; then
+              echo "❌ FATAL: post-deploy origin health check did not return 200 — failing deploy (MAG2-426)"
+              false
+            fi
+          fi
+
           # Prune old generated backups (keep most recent 1) + clean up version backup
           ls -dt generated.old.* 2>/dev/null | tail -n +2 | xargs -r rm -rf 2>/dev/null || true
           rm -rf "$BACKUP_DIR"
-          
+
           echo "✅ Deployment complete!"
           EOF
           
@@ -218,42 +262,17 @@ jobs:
           
           # Execute deployment via SSH
           scp -o IdentitiesOnly=yes -i ~/.ssh/deploy_key deploy.sh ${{ inputs.ssh_user }}@${{ inputs.ssh_host }}:/tmp/
-          ssh -o IdentitiesOnly=yes -i ~/.ssh/deploy_key ${{ inputs.ssh_user }}@${{ inputs.ssh_host }} "bash /tmp/deploy.sh ${{ inputs.app_path }} ${{ inputs.deploy_branch }}"
+          ssh -o IdentitiesOnly=yes -i ~/.ssh/deploy_key ${{ inputs.ssh_user }}@${{ inputs.ssh_host }} "bash /tmp/deploy.sh ${{ inputs.app_path }} ${{ inputs.deploy_branch }} '${{ inputs.health_check_url }}'"
       
-      - name: Health check
+      - name: Health check (informational)
         if: inputs.health_check_url != ''
         run: |
-          echo "🏥 Running health check..."
-          sleep 10
-          
-          MAX_ATTEMPTS=5
-          ATTEMPT=1
-          
-          while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
-            echo "Attempt $ATTEMPT of $MAX_ATTEMPTS..."
-            
-            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 60 ${{ inputs.health_check_url }})
-            
-            if [ $HTTP_CODE -eq 200 ]; then
-              echo "✅ Health check passed! (HTTP $HTTP_CODE)"
-              exit 0
-            fi
-            
-            if [ $HTTP_CODE -eq 503 ]; then
-              echo "⚠️ Site in maintenance mode (HTTP 503) — deploy may have failed"
-            else
-              echo "⚠️ Health check returned HTTP $HTTP_CODE"
-            fi
-            
-            ATTEMPT=$((ATTEMPT + 1))
-            
-            if [ $ATTEMPT -le $MAX_ATTEMPTS ]; then
-              sleep 15
-            fi
-          done
-          
-          echo "❌ Health check failed after $MAX_ATTEMPTS attempts"
-          exit 1
+          # MAG2-426: the REAL post-deploy health gate now runs server-side inside the deploy
+          # step (origin curl with Host header, bypassing the Cloudflare WAF). This GitHub-runner
+          # curl is kept for visibility only and NEVER fails the job — the WAF 403s the runner IP,
+          # so a non-200 here is expected and used to mask genuine deploy failures (the bug).
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 ${{ inputs.health_check_url }} || echo 000)
+          echo "ℹ️ Public URL ${{ inputs.health_check_url }} from GH runner → HTTP $HTTP_CODE (403/000 expected: Cloudflare WAF blocks the runner; real gate is the server-side origin check in the deploy step — MAG2-426)."
       
       - name: Deployment summary
         if: always()
