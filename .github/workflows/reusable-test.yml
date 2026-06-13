@@ -72,10 +72,14 @@ jobs:
           coverage: none
       
       - name: Setup Composer auth (Magento)
-        if: inputs.system_type == 'magento' && secrets.composer_auth != ''
+        if: inputs.system_type == 'magento'
+        env:
+          COMPOSER_AUTH_JSON: ${{ secrets.composer_auth }}
         run: |
-          mkdir -p ~/.composer
-          echo '${{ secrets.composer_auth }}' > ~/.composer/auth.json
+          if [ -n "$COMPOSER_AUTH_JSON" ]; then
+            mkdir -p ~/.composer
+            echo "$COMPOSER_AUTH_JSON" > ~/.composer/auth.json
+          fi
       
       - name: Install Composer dependencies (Magento)
         if: inputs.system_type == 'magento'
